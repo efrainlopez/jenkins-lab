@@ -1,0 +1,735 @@
+/*
+   Name:Jenkins Deploy Db template for Datbase Projects
+   
+	 Description: Template version used for DB projects splitted into three steps.
+	 Build: . Maps old DB CI job.
+	 Pre-Deploy Report: . Maps old Pre-Deploy Report job.
+	 Deploy: . Maps Deploy to job.
+   
+	 Author: elopez, jsantana
+*/
+
+@Library('jenkins-shared-libraries')
+import com.icw.redgate.CreateArtifactMetadataFile as Cam
+import com.icw.DbPipelineComboBox as Dpcm
+import com.icw.SlackNotifications
+import com.icw.UpdatePomAndProperties as Chpp
+import com.icw.checkstyle.CreateCodeStyleReport as Ccsr
+import com.icw.ArtifactoryTools as Art
+
+//------------------------------------------------------------------------------------------------------------
+//TODO: For implementers 
+//These are the only values you need to configure in this file. 
+//------------------------------------------------------------------------------------------------------------
+
+//[Required] - Which database will this pipeline deploy to? Example= SIMS, CERT, Employee, etc.
+//The Database name will be the Project's name
+def databaseName = "JenkTest"
+def projectName = databaseName
+
+//[Required] - What is the line of business for your project? Example= WCC, WC, Eterprise, SIMS, etc.
+def lineOfBusiness="DevOpsLab"
+
+//[Required] - What is the URL for your project. Select a level up from trunk, this pipeline will look for trunk, branches and tags folders.
+def scmUrl = "https://gitlab.icwgrp.com/jsantana/jenkinstest.git"
+
+//[Optional] - Visual Studio solution or project to for your Unit test with relative path from scmUrl/trunk. Example = MyUnitTests.csproj
+def testProject= ""
+
+//[Optional] - What is your unit test framework for your project? Example: MsTest, nUnit, mbUnit, etc.
+def testFramework = ""
+
+//[Required] - Who sould be notified via email when this build runs? Example: user1@icwgroup.com,user2@icwgroup.com
+def emailTo= "jsantana@icwgroup.com"	
+
+//[Optional] - What slack channel should be notified when this build runs? Example: #mySlackChannel,#mySlackChannel2
+def slackChannel= "#dbcicd"
+
+//[Required] - Servernames to deploy on each environment
+def deploymentServers = [ "DEV","QA","PRD" ] //You can add "INT" AND "STG" as environments if the database has tiers for it.
+
+//------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------
+
+// Artifactory repo config
+def artifactory_server = Artifactory.server 'jenkinspipeline'
+def metadata_file = "nuget-metadata.json"
+def artifact_id = projectName
+def group_id = "ICW/DATABASES/${projectName}"
+def artifact_path = "nuget-local/ICW/DATABASES/${databaseName}"
+def artifactory_url = "http://dc1artweb02.icwgrp.com:8081/artifactory"
+def artifactory_metadata_uri = "${artifactory_url}/${artifact_path}/${metadata_file}"
+def dpcm = new Dpcm()
+def artifactVersion = dpcm.returnVersion(artifactory_metadata_uri)
+def newVersion = artifactVersion
+
+// Database config
+def redgate_tool = "C:\\PROGRA~2\\Red Gate\\SQL Change Automation PowerShell\\sqlci.ps1"
+def sql_guard_path = "C:\\PROGRA~2\\Red Gate\\SQLCodeGuardCmdLine\\SqlCodeGuard30.Cmd.exe"
+def redgate_report_tool = "C:\\jenkinspipelineDatabase\\REDGATE_REPORT.ps1"
+def redgate_deploy_tool = "C:\\jenkinspipelineDatabase\\REDGATE_DEPLOY.ps1"
+def local_shared_libs = "C:\\jenkinspipelineSharedLibs"
+def jobName = databaseName
+def sqlCompareOptions = "IgnoreUserProperties,IgnoreUsersPermissionsAndRoleMemberships,NoDeploymentLogging,ConsiderNextFilegroupInPartitionSchemes,DecryptPost2kEncryptedObjects,DoNotOutputCommentHeader,ForceColumnOrder,IgnoreCertificatesAndCryptoKeys,IgnoreDatabaseAndServerName,IgnoreFileGroups,IgnoreWhiteSpace,IgnoreWithElementOrder,ThrowOnFileParseFailed,UseCompatibilityLevel,IgnoreFillFactor,IgnoreSchemaObjectAuthorization,IgnorePermissions,IncludeDependencies"
+def dbLocalServer = "REDGATEDB"
+def dbLocalName = databaseName + "-LOCAL"
+
+// Pipeline config
+def defaultVersion = "Fetch Artifactory Versions"
+def deployVersions = "This one!" 
+def version = ""
+def deployVersion = params.getOrDefault("Version", defaultVersion).trim()
+def branchType = getBranchType(env.BRANCH_NAME)
+def buildActions = getActiosnPerBrancheType(branchType)
+def deploymentEnvironments = getDeploymentServersPerBrancheType(branchType,deploymentServers)
+def defaultAction = "Pre-Deploy Report"
+def buildAction = params.getOrDefault("BuildAction", defaultAction).trim()
+def refreshPipeline = setRefreshPipeline(buildAction, deployVersion, defaultVersion)
+
+// Environment variables config
+def errorActionPreference = "0"
+def filterName = ""
+def dbPrefix = "DB"
+
+// Init
+def slackNotifications = new SlackNotifications(this); 
+currentBuild.displayName = "Branch ${env.BRANCH_NAME}: ${buildAction}"
+def allowedStages = getStagesPerBrancheType(branchType, buildAction, refreshPipeline )
+
+// Messages
+	def scmChecoutAdditionalInfoMessage = """:thinking_face:- <${BUILD_URL}/console|Review the Build Log for detailed information about the build>
+:bulb:- Ensure *scmUrl* parameter is properly set in Jenkins pipeline .
+:bulb:- Ensure <${scmUrl}|scmUrl> has a valid project to get the source code and it is reachable by Jenkins."""
+
+	def buildAdditionalInfoMessage = """:thinking_face:- <${BUILD_URL}/console|Review the Build Log for detailed information about the build>
+:bulb:- Ensure your source code compiles without Errors before running this build. 
+:bulb:- Ensure all your project dependencies can be resolved.
+:bulb:- Fix all the erros in your solution, check in your changes to SCM and run this build again."""
+
+	def unitTestAdditionalInfoMessage = """:thinking_face:- <${BUILD_URL}/console|Review the Build Log for detailed information about the build>
+:bulb:- Ensure your unit test framework is installed and configured in the Jenkins node running this build. 
+:bulb:- Ensure your unit test source code compiles without Errors before running this build. 
+:bulb:- Ensure all your unit tests passes.
+:bulb:- Fix all the unit tests in your solution, check in your changes to SCM and run this build again."""
+
+// Parameters decription
+def descBuildAction  = "Select the action to perform"
+def descVersion = "Version to Release. Apply only for Pre-Deploy and Deploy actions. \r\n Run with option \"${defaultVersion}\" to refresh this combo."
+def descEnvironment = "Select Deployment Environment. \r\n These options are only applicable if the Build Action selected above is \"Deploy\" or \"Pre-Deploy Report\"."
+		
+
+node{
+	label 'sql'
+	deployVersions= getVersionsPerBrancheType(branchType,artifactory_metadata_uri, defaultVersion)
+
+	chpp = new Chpp()
+	method_to_call = new Art()
+
+	if(buildAction == "Build") {
+    	currentBuild.displayName = " ${buildAction} : Branch - ${env.BRANCH_NAME}"
+    } else {
+		version = params.getOrDefault("Version", defaultVersion).trim()
+		if (version == "Fetch Artifactory Versions") {
+			currentBuild.displayName = version
+		}
+		else {
+			currentBuild.displayName = " ${buildAction} : Version  ${version} vs ${params.Environment}"
+		}
+    }
+
+	 if(refreshPipeline) {
+	 	currentBuild.result = 'ABORTED'
+   	 	return 
+	 }
+}
+
+pipeline {
+    agent { label 'sql' }
+	parameters {
+		//------------------------------------------------------------------------------------------------------------
+		//NOTE: These parameters are ignored for the build process. 
+		//It's just a way to output the values configured in the section above to to users in Jenkins UI.
+		//------------------------------------------------------------------------------------------------------------
+		choice(name: 'BuildAction', choices: buildActions, description: descBuildAction)
+		choice(name: 'Version', choices: deployVersions, description: descVersion)
+		choice(name: 'Environment', choices: deploymentEnvironments , description: descEnvironment)
+		
+    }
+    stages {
+		stage ("0. Setup") {
+			when {  expression { allowedStages.contains("0. Setup") } }
+		    steps {
+				script {
+					// The belows are needed to run the Powershell scripts
+                    env.ERROR_ACTION_PREFERENCE = errorActionPreference
+					env.DB_SERVER = databaseName + dbPrefix + params.Environment
+					env.DB_NAME = databaseName
+					env.ENV = params.Environment
+					env.JOB_NAME = jobName
+					env.JOBNAME = jobName
+					env.PROJECT = projectName
+					env.FILTER_NAME = filterName
+					env.SQL_COMPARE_OPTIONS = sqlCompareOptions
+					env.DIST = version
+				}
+			}
+			post {
+				success {
+					println "Validate Build Action Success"
+			   	}
+			   	failure {
+					println "Failure Validate Build Action"
+				    slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, newVersion,'Build Action validation failure in SQL jenkins node.','danger','FAILED', ""))
+						 mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+							  body: getEmailMessage(projectName, newVersion, 'Build Action validation failure"','FAILED',""))
+				}
+			}
+		}
+	    stage ("1. Cleanup Workspace") {
+			when { expression { allowedStages.contains("1. Cleanup Workspace") } }
+			steps { deleteDir() }
+			post{
+				success { println "Cleanup Workspace Success" }	
+				failure {
+						println "Failure Cleaning up Workspace" 
+						slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, newVersion,'Unable to cleanup workspace in SQL jenkins node.','danger','FAILED', ""))
+						mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+							body: getEmailMessage(projectName, newVersion, 'Unable to Cleanup Workspace"','FAILED',""))
+				}
+			}
+		}
+		stage ("2. SCM Checkout") {
+			when { expression { allowedStages.contains("2. SCM Checkout") } }
+			steps { checkout scm }
+			post {
+				success { println "SCM Checkout Success" }	
+				failure {
+						slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, newVersion,'Unable to Checkout from SCM','danger','FAILED', scmChecoutAdditionalInfoMessage))
+						mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+							body: getEmailMessage(projectName, newVersion, 'Unable to Checkout from SCM','FAILED',scmChecoutAdditionalInfoMessage))
+				}
+			}
+		}
+		stage ("3. Code Quality") {
+			when { expression { allowedStages.contains("3. Code Quality") } }
+			steps {
+				script { 
+					dir("${pwd()}/Reports") {
+						def root_dir = pwd().replace("\\",'/')
+						def excluded_rules = "BP001;BP002;BP003;BP004;BP005;BP006;BP007;BP008;BP009;BP010;BP011;BP012;BP013;BP014;BP015;BP016;BP017;BP018;BP019;BP020;BP021;BP022;BP023;BP024"
+						excluded_rules += ";DEP001;DEP002;DEP003;DEP004;DEP005;DEP006;DEP007;DEP008;DEP009;DEP010;DEP011;DEP012;DEP013;DEP014;DEP015;DEP016;DEP017;DEP018;DEP019;DEP020;DEP021;DEP022;DEP023;DEP024;DEP025;DEP026;DEP026;DEP027;DEP028"
+						excluded_rules += ";ST001;ST002;ST003;ST004;ST005;ST006;ST007;ST008;ST009;ST010;ST011;ST012;ST013"
+						log.info "Execute SQLCodeGuard for SPs and Tables"
+						// Windows bat creates xml files in UCS2 format as default encoding, we need to convert to UTF-8 first
+						bat returnStdout: true, encoding: 'UTF-8', script:"\"${sql_guard_path}\" /include:ALL /exclude:${excluded_rules} /source:MASTER\\Tables /q /out ${pwd()}\\cqt.xml"
+						bat returnStdout: true, encoding: 'UTF-8', script:"\"${sql_guard_path}\" /include:ALL /exclude:${excluded_rules} /source:MASTER\\Stored_Procedures /q /out ${pwd()}\\cqsps.xml"
+						
+						// Windows bat creates xml files in UCS2 format as default encoding, we need to convert to UTF-8 first
+						log.info "Convert UCS2 to UTF"
+						def ucs2utfs1_path = "${local_shared_libs}\\CONVERT_UCS2_UTF8.ps1"
+						bat returnStdout: true, encoding: 'UTF-8', script: "powershell -NonInteractive -ExecutionPolicy Bypass -File \"${ucs2utfs1_path}\"  -OriginalFile cqsps.xml -OutputFile cqsps_utf.xml"
+						bat returnStdout: true, encoding: 'UTF-8', script: "powershell -NonInteractive -ExecutionPolicy Bypass -File \"${ucs2utfs1_path}\"  -OriginalFile cqt.xml -OutputFile cqt_utf.xml"
+												
+						def xml_sps_content = readFile file: "cqsps_utf.xml", encoding: 'UTF-8'
+						def xml_tables_content = readFile file: 'cqt_utf.xml', encoding: 'UTF-8'
+						log.info xml_sps_content.take(200)
+						log.info xml_tables_content.take(200)
+
+						log.info "Create HTML reports by SPs and Tables"
+						method_to_call = new Ccsr()
+						def sps_report = method_to_call.createCodeStyleHtmlReport(root_dir, xml_sps_content)
+						fileOperations([fileCreateOperation(fileContent: sps_report, fileName: 'sps_codequality.html')])
+						xml_sps_content = null
+						
+						def tables_report = method_to_call.createCodeStyleHtmlReport(root_dir, xml_tables_content)
+						fileOperations([fileCreateOperation(fileContent: tables_report, fileName: 'tables_codequality.html')])
+						xml_tables_content = null
+						
+						publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: './', reportFiles: 'tables_codequality.html', reportName: 'Code Quality Tables', reportTitles: ''])
+						publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: './', reportFiles: 'sps_codequality.html', reportName: 'Code Quality SPs', reportTitles: ''])
+					}
+				}
+			}
+			post {
+				success { println "Code Quality Success" }	
+				failure{
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, newVersion, 'Unable to perform Code Quality','danger','FAILED'))
+						
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, newVersion, 'Unable to perform Code Quality','FAILED'))
+				}
+			}
+		}
+		stage ("4. Unit Test") {
+			when { expression { allowedStages.contains("4. Unit Test") } }
+			steps {
+				script { bat 'echo "Run redgate tSQLt"' }
+			}
+			post {
+				success{ println "Unit Test Sucess" }	
+				failure{
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, newVersion, 'Unit Test failed','danger','FAILED',unitTestAdditionalInfoMessage))
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, newVersion, 'Unit Test failed','FAILED',unitTestAdditionalInfoMessage))
+				}
+			}
+		}
+		stage ("5. Build") {
+			when { expression { allowedStages.contains("5. Build") } }
+			steps {
+				script {
+					dir(pwd()) {
+						bat 'del *.nupkg'
+						bat 'del *.json'
+						def command = "powershell -NonInteractive -ExecutionPolicy Bypass -File \"${redgate_tool}\" -Verbose Build -scriptsFolder ${pwd()} -packageId ${jobName} -packageVersion ${newVersion} -Options ${sqlCompareOptions} -temporaryDatabaseServer ${dbLocalServer} -temporaryDatabaseName ${dbLocalName}"
+						bat "${command}"
+					}
+				}
+			}
+			post{
+				success{ println "Build Success" }	
+				failure{
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, newVersion, 'Build failed','danger','FAILED', buildAdditionalInfoMessage))
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, newVersion, 'Build failed','FAILED', buildAdditionalInfoMessage))
+				}
+			}
+		}
+		stage ("6. Push to Artifactory") {
+			when { expression { allowedStages.contains("6. Push to Artifactory") } }
+			steps {
+				script {
+					dir(pwd()) {
+						method_to_call = new Cam()
+						def json_output = method_to_call.createMetaFile(newVersion, artifactory_metadata_uri, group_id, artifact_id)
+						writeFile file: metadata_file, text: json_output
+						/**
+						* Do we need to create a TAG?
+						withCredentials([usernamePassword(credentialsId: 'svn_svc', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+							bat returnStdout: false, script: "svn --username=${USERNAME} --password=${PASSWORD}  copy ${svn_root}/trunk@${revisions} ${svn_root}/tags/${version}" //-m 'TAGGING ${version} for release from revision ${revisions}'"
+						}
+						**/
+						def uploadSpec = """{
+						"files": [
+							{
+							"pattern": "${jobName}.${newVersion}.nupkg",
+							"target": "${artifact_path}/"
+							},
+							{
+							"pattern": "${metadata_file}",
+							"target": "${artifact_path}/"
+							}
+						]
+						}"""
+						artifactory_server.upload(uploadSpec)
+					}
+				}
+			}
+			post {
+				success { println "Push to Artifactory Sucess" }
+				failure {
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, version, 'Push to Artifactory failed','danger','FAILED'))
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, version, 'Push to Artifactory failed','FAILED'))
+				}
+			}
+		}
+		stage ("7. Clean up Report") {
+			when {  expression { allowedStages.contains("7. Clean up Report") } }
+			steps {
+				script {
+					dir(pwd()) {
+						fileOperations([folderDeleteOperation('REPORT')])
+					}
+				}
+			}
+			post {
+				success { println "Clean up Report Success" }	
+				failure {
+					println "Clean up Report Failure"
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, version, "Clean up Report Failure",'danger','FAILED'))
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, version, 'Clean up Report Failure','FAILED'))
+				}
+			}
+		}
+		stage ("8. Download Artifact") {
+			when { expression { allowedStages.contains("8. Download Artifact") } }
+			steps {
+				script {
+					dir(pwd()) {
+						fileOperations([
+							fileDownloadOperation(
+								password: '', 
+								targetFileName: "${projectName}.${version}.nupkg", 
+								targetLocation: './', 
+								url: "${artifactory_url}/${artifact_path}/${jobName}.${version}.nupkg", 
+								userName: ''
+							)	
+						])	
+					}		
+				}
+			}
+			post {
+				success { 
+					println "Download Artifact Success"
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, version,'Success uploading Artifact to Artifactory','good','SUCCESS'))
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - SUCCESS",
+						body: getEmailMessage(projectName, version, 'Success downloading Artifact from Artifactory','SUCCESS'))
+
+				}	
+				failure {
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, version,'Error downloading Artifact to Artifactory','danger','FAILED'))
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, version, 'Error downloading Artifact from Artifactory','FAILED'))
+				}
+			}
+		}
+		stage ("9. Run Report") {
+			when { expression { allowedStages.contains("9. Run Report") } }
+			steps {
+				script {
+					dir(pwd()) {
+						def command = "powershell -NonInteractive -ExecutionPolicy Bypass -File \"${redgate_report_tool}\"" // ${report_params}"
+						bat "${command}"
+					}	
+				}
+			}
+			post {
+				success {
+					println "Run Report Success"
+					dir(pwd()){
+						publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: './REPORT/Reports', reportFiles: 'Changes.html', reportName: 'Redgate Report', reportTitles: ''])
+					}
+				}
+				failure {
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, deployVersion, params.Environment,"Unable to Run Report "+ 'danger','FAILED'))
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, deployVersion, params.Environment, "Unable to Run Report "+ 'FAILED'))
+				}
+			}
+		}
+		stage ('10. Clean up Build') {
+			when { expression { allowedStages.contains("10. Clean up Build") } }
+			steps {
+				script {
+					dir(pwd()) {
+						fileOperations([folderDeleteOperation('BUILD')])
+					}
+				}
+			}
+			post {
+				success { println "Clean up Build Success" }
+				failure {
+					slackSend(channel: slackChannel,  attachments: getSlackMessage (projectName, deployVersion, params.Environment,'Clean up Build Failure','danger','FAILED',deploymentAdditionalInfoMessage))
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, deployVersion, params.Environment, 'Clean up Build Failure','FAILED'))
+				}
+			}
+		}
+		stage ('11. Download Artifact Deploy') {
+			when { expression { allowedStages.contains("11. Download Artifact Deploy") } }
+			steps {
+				script {
+					dir(pwd()) {
+						fileOperations([
+							fileDownloadOperation(
+								password: '', 
+								targetFileName: "${projectName}.${version}.nupkg", 
+								targetLocation: './', 
+								url: "${artifactory_url}/${artifact_path}/${jobName}.${version}.nupkg", 
+								userName: ''
+							)
+						])
+					}
+				}
+			}
+			post {
+				success {
+					println "Download Artifact Deploy Success"
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, deployVersion, params.Environment, params.DeploymentMode +' Success','good','SUCCESS'))  	
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - SUCCESS",
+						body: getEmailMessage(projectName, deployVersion, params.Environment, params.DeploymentMode +' SUCCESS','SUCCESS'))  	
+				}
+				failure {
+					slackSend(channel: slackChannel, attachments: getSlackMessage (projectName, deployVersion, params.Environment,params.DeploymentMode +' Error downloading Artifact Deploy to Artifactory','danger','FAILED',deploymentAdditionalInfoMessage))
+					
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, deployVersion, params.Environment, params.DeploymentMode +' Error downloading Artifact Deploy to Artifactory','FAILED'))
+				}
+			}
+		}
+		stage ('12. Deploy') {
+			when { expression { allowedStages.contains("12. Deploy") }  }
+			steps {
+				script {
+					dir(pwd()){
+						def command = "powershell -NonInteractive -ExecutionPolicy Bypass -File \"${redgate_deploy_tool}\""// ${report_params}"
+						bat "${command}"
+					}
+				}
+			}
+			post {
+				success {
+					println "Deploy success"
+					dir(pwd()) {
+						publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: './REPORT/Reports', reportFiles: 'Changes.html', reportName: 'Redgate Report', reportTitles: ''])
+					}
+				}
+				failure {
+					slackSend(channel: slackChannel,  attachments: getSlackMessage (projectName, deployVersion, params.Environment,'Error on Deploy','danger','FAILED',deploymentAdditionalInfoMessage))
+					mail(to: emailTo, subject: "Project:${projectName} - ${env.BUILD_DISPLAY_NAME} - FAILED",
+						body: getEmailMessage(projectName, deployVersion, params.Environment, 'Error on Deploy','FAILED'))
+				}
+			}
+		}
+	}
+}
+node {
+	label 'sql'
+	script {
+		if(buildAction == "Build") {
+			println 'Parameters Refresh'
+			def newVersions = getVersionsPerBrancheType(branchType,artifactory_metadata_uri, defaultVersion)
+			setParameters(branchType, newVersions, defaultVersion, deploymentServers, descBuildAction, descVersion, descEnvironment)
+		}
+	}
+}
+
+
+def getEmailMessage(projectName, version, message, status,additionalInfo='')
+{
+	return """Project:${projectName}
+			Build Name: ${env.BUILD_DISPLAY_NAME}
+			Status: ${status}
+			Message: ${message}
+			Version: ${version}
+			Additional Info:
+			${additionalInfo}
+			Build Link: ${env.BUILD_URL}"""
+}
+
+def getSlackMessage(projectName, version, message, color,status,additionalInfo='')
+{
+	def attachmentPayload = [[
+							fallback: "${projectName} execution #${env.BUILD_NUMBER}",
+							color: "${color}",
+							fields:[
+									[
+											title: "Project:${projectName}",
+											value: "Build Name:${env.BUILD_DISPLAY_NAME}",
+											short: false
+									],
+									
+									[  
+											title: "Status",
+											value: "${status}",
+											short: true
+									],
+									[  
+											title: "Message",
+											value: "${message}",
+											short: true
+									],
+									[  
+											title: "Version",
+											value: "${version}",
+											short: true
+									],
+									[  
+											title: "Additional Info",
+											value: "${additionalInfo}",
+											short: false
+									]
+
+									
+							],
+							actions:[
+									[
+										name: "View Build",
+										text: "View Build",
+										type: "button",
+										value: "View Build",
+										url: "${BUILD_URL}",
+										style: "primary"
+									]
+									
+							]
+					]]
+
+	return attachmentPayload		
+}
+
+//Gets the branch type based on the full name.
+def getBranchType(branchName)
+{
+	def branchSplit = branchName.split('/');
+
+	return branchSplit[0];
+}
+//Returns the list of actions allowed to executed on this branch type
+//Feature: Build/Deploy Lower Tiers
+//Master: Build/Deploy Lower Tiers
+//Release: Build/Deploy Lower and Upper Tiers
+def getActiosnPerBrancheType(branchType = "")
+{
+	if(branchType == "")
+		throw new Exception("The branch name cannot be null or blank space.")
+
+	def allowedActions = ["Pre-Deploy Report"]
+	
+	if(branchType.startsWith("master")) {
+		allowedActions << "Build"
+		allowedActions << "Deploy"
+	} else if(branchType.startsWith("feature")) {
+		allowedActions << "Build"
+		allowedActions << "Deploy"
+	} else if(branchType.startsWith("bugfix")) {
+		allowedActions << "Build"
+		allowedActions << "Deploy"
+	} else if(branchType.startsWith("release")) {
+		allowedActions << "Build"
+		allowedActions << "Deploy"
+	}
+	
+	return allowedActions
+}
+
+def getVersionsPerBrancheType(branchType = "", artifactory_metadata_uri, defaultVersion)
+{
+	if(branchType == "")
+		throw new Exception("The branch name cannot be null or blank space.")
+
+	def versions = "This version"
+	
+	if(branchType.startsWith("master")) {
+		versions = getArtifactoryPackageVersion(artifactory_metadata_uri,defaultVersion)
+	}
+
+	return versions
+}
+
+//Retrieves the versions for this project from artifactory.
+def getArtifactoryPackageVersion(nugetMetadata, defaultVersion)
+{
+	try {
+		def myJson = sh returnStdout: true, script: 'curl \'' + nugetMetadata + '\' | jq \'. | {versions: .versioning.versions}\''
+		////Clean up Json string to get versions.
+		//myJson = myJson.minus("versions").minus(":").minus("[").minus("]").minus('{').minus("}").replace(",","").replace("\"", "").trim();
+		myJson = Arrays.asList(myJson.minus("versions").minus(":").minus("[").minus("]").minus('{').minus("}").replace("\"", "").trim().split(","))
+		def newJson = []
+		def counter = myJson.size()
+		for (i = counter; i >=0 ; i--) {
+   			newJson << myJson[i]
+		}
+		newJson.remove(0)
+		
+		return  newJson == "null" ? [defaultVersion] : newJson << defaultVersion
+	}
+	catch( Exception e) {
+		println e
+			return [defaultVersion]
+	}
+}
+
+// returns the allowed servers for deployment based on the branch type. 
+// Feature, Bugfix, should never be deployed to STG or production.
+def getDeploymentServersPerBrancheType(branchType = "", deploymentServers)
+{
+	if(branchType == "")
+		throw new Exception("The branch name cannot be null or blank space.")
+	
+	def allowedEnvironments = deploymentServers;
+
+	return allowedEnvironments
+}
+
+def setRefreshPipeline(buildAction, deployVersion, defaultVersion)
+{
+	def refreshPipelineLocal = false
+
+	if(buildAction != "Build") {
+		refreshPipelineLocal = deployVersion == defaultVersion
+	}
+
+	return refreshPipelineLocal
+}
+
+def getStagesPerBrancheType(branchType = "", buildAction, refreshPipeline )
+{
+	if(refreshPipeline) return [""]
+
+	//Stages in this pipeline
+	def setupStage = "0. Setup"
+	def cleanUpWorkSpaceStage = "1. Cleanup Workspace"
+	def scmCheckoutStage = "2. SCM Checkout"
+	def codeQualityStage = "3. Code Quality"
+	def unitTestStage = "4. Unit Test"
+	def buildStage = "5. Build"
+	def pushArtifactoryStage = "6. Push to Artifactory"
+	def cleanUpReportStage = "7. Clean up Report"
+	def downloadArtifactStage = "8. Download Artifact"
+	def runReportStage = "9. Run Report"
+	def cleanUpBuildStage = "10. Clean up Build"
+	def downloadArtifactDeployStage = "11. Download Artifact Deploy"
+	def deployStage = "12. Deploy"
+
+	if(branchType == "")
+		throw new Exception("The branch name cannot be null or blank space.")
+
+	//This covers the steps when the branch is feature/bug/release 
+	if(buildAction == "Build") {
+		return  [cleanUpWorkSpaceStage, scmCheckoutStage, codeQualityStage, unitTestStage, buildStage, pushArtifactoryStage]
+	} 
+
+	if(buildAction == "Pre-Deploy Report") {
+		return [setupStage,cleanUpWorkSpaceStage, scmCheckoutStage, cleanUpReportStage, downloadArtifactStage, runReportStage]
+	} 
+
+	if(buildAction == "Deploy") {
+		return [setupStage,cleanUpWorkSpaceStage, scmCheckoutStage, cleanUpBuildStage, downloadArtifactDeployStage, deployStage]
+	}
+}
+
+
+def setParameters(branchType, newVersions, defaultVersion, deploymentServers, descBuildAction, descVersion, descEnvironment) {
+	/* Create jenkins instance and get all jobs. */
+	def item = Jenkins.getInstance().getItemByFullName("job-config-tools/ConfigurationTests/Database Git/Database Git/master")
+
+	if (item instanceof org.jenkinsci.plugins.workflow.job.WorkflowJob) {
+		Object[] jobsArray = item.getAllJobs().toArray();
+		for (Object job: jobsArray) {
+			if (((Job) job).getDisplayName().equals("master")) {
+				/* Build Action parameter */
+				String[] choicesBuildAction = getActiosnPerBrancheType(branchType);
+				StringParameterDefinition stringBuildAction = new StringParameterDefinition("BuildActionDefault", choicesBuildAction[0], descBuildAction);
+				ChoiceParameterDefinition choiceParamWithoutDefaultValueBuildAction = new ChoiceParameterDefinition("BuildAction", choicesBuildAction, descBuildAction);
+				ParameterDefinition choiceParameterBuildAction = choiceParamWithoutDefaultValueBuildAction.copyWithDefaultValue(stringBuildAction.getDefaultParameterValue());
+				/* Version parameter */
+				String[] choicesVersion = newVersions
+				StringParameterDefinition stringVersion = new StringParameterDefinition("VersionDefault", choicesVersion[0], descVersion);
+				ChoiceParameterDefinition choiceParamWithoutDefaultValueVersion = new ChoiceParameterDefinition("Version", choicesVersion, descVersion);
+				ParameterDefinition choiceParameterVersion = choiceParamWithoutDefaultValueVersion.copyWithDefaultValue(stringVersion.getDefaultParameterValue());
+				/* Environment parameter */
+				String[] choicesEnvironment = getDeploymentServersPerBrancheType(branchType,deploymentServers)
+				StringParameterDefinition stringEnvironment = new StringParameterDefinition("EnvironmentDefault", choicesEnvironment[0], descEnvironment);
+				ChoiceParameterDefinition choiceParamWithoutDefaultValueEnvironment = new ChoiceParameterDefinition("Environment", choicesEnvironment, descEnvironment);
+				ParameterDefinition choiceParameterEnvironment = choiceParamWithoutDefaultValueEnvironment.copyWithDefaultValue(stringEnvironment.getDefaultParameterValue());
+				/* Adding new parameter values */ 
+				ParameterDefinition[] newParameters = [choiceParameterBuildAction, choiceParameterVersion, choiceParameterEnvironment];
+				/* Remove old parameters from JobName */      
+				((Job) job).removeProperty(ParametersDefinitionProperty.class);
+				/* Add new Parameters to JobName */
+				((Job) job).addProperty(new ParametersDefinitionProperty(newParameters));
+				println "Parameters refresh performed"
+			}
+		}
+	}
+}
